@@ -1,0 +1,173 @@
+diff --git a/relay/relay.py b/relay/relay.py
+index 15d264a..3bea829 100644
+--- a/relay/relay.py
++++ b/relay/relay.py
+@@ -32,6 +32,11 @@ import zlib
+ from urllib.parse import urlsplit, parse_qs
+ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+ 
++try:
++    import model_probe  # local read-only served-model probe (same directory)
++except ImportError:  # relay.py copied standalone; --probe-log will be refused
++    model_probe = None
++
+ HOP_BY_HOP = {
+     "connection",
+     "proxy-connection",
+@@ -296,6 +301,18 @@ def attempt(path, headers, body, timeout, commit_by, cancelled=lambda: False):
+         conn.sock = WatchedSocket(conn.sock, watch, timeout)
+         resp = conn.getresponse()
+         response_headers = dict(resp.getheaders())
++        if getattr(ARGS, "observe_only", False):
++            # Pure observation: never inspect the SSE head for retry decisions,
++            # never buffer output. Return immediately so the body is streamed
++            # straight through by _stream_back (which also feeds the probe).
++            # This removes the "changed request timing" residual entirely.
++            if resp.status != 200:
++                data = resp.read()
++                return "passthrough", resp.status, response_headers, data, None, "http " + str(resp.status)
++            watch.commit()
++            conn._relay_watch = watch
++            retained = True
++            return "stream", 200, response_headers, b"", conn, resp
+         if resp.status != 200:
+             data = resp.read()
+             try:
+@@ -449,6 +466,18 @@ class Handler(BaseHTTPRequestHandler):
+ 
+         cport = self.client_address[1]
+         log(f"[{cport}] {self.command} {path} ({len(body)}B){analyze(self, body)}")
++
++        # Read-only served-model probe. Disabled entirely unless --probe-log or
++        # --observe-only is given, so the default relay behaviour is unchanged.
++        probe = None
++        probe_on = bool(getattr(ARGS, "probe_log", "")) or bool(getattr(ARGS, "observe_only", False))
++        if model_probe is not None and probe_on:
++            probe = model_probe.Probe(
++                getattr(ARGS, "probe_log", ""),
++                "p%d_%d" % (cport, id(self) & 0xFFFFF),
++                body, self.headers.get("Content-Encoding", ""),
++            )
++
+         deadline = time.monotonic() + ARGS.total_budget
+         attempt_no = 0
+         last = None
+@@ -456,6 +485,8 @@ class Handler(BaseHTTPRequestHandler):
+             if self._client_gone():
+                 # Codex cancelled the turn or exited; stop burning upstream quota.
+                 log(f"[{cport}] abandoning retries after {attempt_no} attempts (client gone)")
++                if probe is not None:
++                    probe.finish()
+                 return
+             if time.monotonic() >= deadline:
+                 log(f"[{cport}] giving up after {attempt_no} attempts")
+@@ -463,25 +494,33 @@ class Handler(BaseHTTPRequestHandler):
+                     self._retry_failure(*last)
+                 else:
+                     self._send_simple(504, {"Content-Type": "text/plain"}, b"relay: retry deadline reached\n")
++                if probe is not None:
++                    probe.finish()
+                 return
+             attempt_no += 1
+             mode, status, resp_headers, prelude, conn, resp = attempt(
+                 upstream_path, headers, body, ARGS.timeout,
+                 min(deadline, time.monotonic() + ARGS.commit_deadline), self._client_gone,
+             )
++            if probe is not None:
++                probe.note_headers(resp_headers, mode, status)
+             if mode == "stream":
+                 log(f"[{cport}] attempt {attempt_no}: ok, streaming")
+-                self._stream_back(resp_headers, prelude, conn, resp)
++                self._stream_back(resp_headers, prelude, conn, resp, probe)
+                 return
+             if mode == "passthrough":
+                 log(f"[{cport}] attempt {attempt_no}: upstream {status}, passthrough")
+                 self._send_simple(status, resp_headers, prelude)
++                if probe is not None:
++                    probe.finish()
+                 return
+             last = (status, resp_headers, prelude)
+             log(f"[{cport}] attempt {attempt_no}: retryable ({resp})")
+             if attempt_no >= ARGS.max_attempts or time.monotonic() >= deadline:
+                 log(f"[{cport}] giving up after {attempt_no} attempts")
+                 self._retry_failure(*last)
++                if probe is not None:
++                    probe.finish()
+                 return
+             delay = min(ARGS.backoff_max, ARGS.backoff_base * (1.6 ** (attempt_no - 1)))
+             delay = max(delay * random.uniform(0.7, 1.3), retry_after(resp_headers))
+@@ -489,6 +528,8 @@ class Handler(BaseHTTPRequestHandler):
+             while time.monotonic() < end:
+                 if self._client_gone():
+                     log(f"[{cport}] abandoning retries after {attempt_no} attempts (client gone)")
++                    if probe is not None:
++                        probe.finish()
+                     return
+                 time.sleep(min(0.1, max(0, end - time.monotonic())))
+ 
+@@ -524,7 +565,7 @@ class Handler(BaseHTTPRequestHandler):
+         finally:
+             conn.close()
+ 
+-    def _stream_back(self, resp_headers, prelude, conn, resp):
++    def _stream_back(self, resp_headers, prelude, conn, resp, probe=None):
+         # Once committed, preserve all bytes and close even if header delivery fails.
+         try:
+             self.send_response(200)
+@@ -539,15 +580,23 @@ class Handler(BaseHTTPRequestHandler):
+             self.close_connection = True
+             self.wfile.write(prelude)
+             self.wfile.flush()
++            # Observation only happens AFTER the bytes went downstream, so the
++            # probe can never delay or alter what Codex receives.
++            if probe is not None:
++                probe.feed(prelude)
+             while True:
+                 chunk = resp.read1(65536) if hasattr(resp, "read1") else resp.read(65536)
+                 if not chunk:
+                     break
+                 self.wfile.write(chunk)
+                 self.wfile.flush()
++                if probe is not None:
++                    probe.feed(chunk)
+         except (BrokenPipeError, ConnectionResetError, OSError):
+             pass
+         finally:
++            if probe is not None:
++                probe.finish()
+             watch = getattr(conn, "_relay_watch", None)
+             if watch:
+                 watch.close()
+@@ -604,8 +653,18 @@ def main():
+                    help="max seconds to hold the stream head while deciding to retry")
+     p.add_argument("--timeout", type=float, default=600.0)
+     p.add_argument("--log", default="")
++    p.add_argument("--probe-log", default="",
++                   help="read-only served-model recording to a local JSONL (disabled when empty)")
++    p.add_argument("--observe-only", action="store_true",
++                   help="pure observation: no retry, no SSE buffering, no retry classification")
+     p.add_argument("--identity-file", default="", help="local key for installer readiness verification")
+     ARGS = p.parse_args()
++    if ARGS.probe_log and model_probe is None:
++        p.error("model_probe.py is not next to relay.py; cannot enable --probe-log")
++    if ARGS.observe_only:
++        # Pure observation implies a single attempt: overload responses are
++        # passed through verbatim instead of being replayed.
++        ARGS.max_attempts = 1
+     ARGS.identity_key = b""
+     with open(__file__, "rb") as f:
+         ARGS.relay_digest = hashlib.sha256(f.read()).hexdigest()
+@@ -628,7 +687,12 @@ def main():
+         ARGS.proxy = (host, int(port or 80))
+ 
+     srv = LocalRelayServer(("127.0.0.1", ARGS.port), Handler)
+-    log(f"relay listening on 127.0.0.1:{ARGS.port} -> {ARGS.upstream_scheme}://{ARGS.upstream} via {ARGS.proxy}")
++    mode_note = ""
++    if ARGS.observe_only:
++        mode_note += " [OBSERVE-ONLY: no retry / no SSE buffering]"
++    if ARGS.probe_log:
++        mode_note += " [PROBE -> %s]" % ARGS.probe_log
++    log(f"relay listening on 127.0.0.1:{ARGS.port} -> {ARGS.upstream_scheme}://{ARGS.upstream} via {ARGS.proxy}{mode_note}")
+     srv.daemon_threads = True
+     try:
+         srv.serve_forever()
